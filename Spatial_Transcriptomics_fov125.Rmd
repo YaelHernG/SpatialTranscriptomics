@@ -1,0 +1,514 @@
+---
+title: "Pipeline MERFISH — fov_125"
+author: "Paola Albarran Godoy & Yael Daniel Hernandez Gonzalez"
+date: "2026-06-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = "/home/yael/Documents/Spatial Transcriptomics/fov_125")
+```
+
+## Introducción
+
+Este reporte documenta el pipeline completo para obtener una matriz de expresión génica a partir de imágenes de microscopía de fluorescencia generadas con la tecnología MERFISH (Multiplexed Error-Robust Fluorescence In Situ Hybridization). Trabajamos con el campo visual número 125 (fov_125) del dataset de células U-2 OS publicado por Moffitt et al. (2016).
+
+La idea central de MERFISH es que cada gen está codificado con un barcode binario único que se lee a lo largo de 8 rondas de hibridación en 2 canales de fluorescencia, dando 16 bits de información por molécula de RNA. A partir de las imágenes ya preprocesadas en FIJI (filtrado de fondo, deconvolución y suavizado), hacemos aquí todo el análisis en R: normalización, decodificación, segmentación y construcción del objeto Seurat.
+
+------------------------------------------------------------------------
+
+## 1. Carga de datos
+
+Las imágenes de fluorescencia vienen como un hiperstack de 16 cuadros (8 rondas × 2 canales), cada uno de 2048 × 2048 píxeles. Este hiperstack fue preprocesado previamente en FIJI para limpiar el ruido y el fondo de autofluorescencia.
+
+```{r carga-datos}
+library(EBImage)
+library(tidyverse)
+
+fov_num <- 125
+fov_dir <- sprintf("fov_%03d", fov_num)
+
+img <- readImage(paste0("merfish_processed_", fov_dir, ".tif"))
+cat("Dimensiones de la imagen:", dim(img), "\n")
+cat("Frames: 8 rondas x 2 canales = 16\n")
+
+frame_map <- expand.grid(ch = 0:1, r = 0:7)
+```
+
+------------------------------------------------------------------------
+
+## 2. Visualización de las rondas de hibridación
+
+Cada cuadro corresponde a una ronda de hibridación. Los puntos brillantes que se ven son clusters de sondas fluorescentes unidas a moléculas individuales de RNA. Distintos genes se iluminan en distintas rondas dependiendo de su código de barras.
+
+```{r visualizacion-rondas, fig.width=10, fig.height=5}
+par(mfrow = c(2, 4), mar = c(1, 1, 2, 1))
+for (i in seq(2, 16, by = 2)) {
+  frame <- img[,,i]
+  upper <- quantile(frame, 0.995)
+  frame[frame > upper] <- upper
+  frame[frame < 0] <- 0
+  frame <- frame / (max(frame) - min(frame))
+  display(normalize(frame), method = "raster")
+}
+```
+
+------------------------------------------------------------------------
+
+## 3. El codebook
+
+El codebook es la tabla que relaciona cada gen con su código binario único. Cada fila es un gen y cada columna es un bit (ronda/canal). Un valor de 1 significa que ese gen debe verse fluorescente en esa ronda y canal; 0 significa que no debe verse. Con 16 bits y distancia Hamming mínima de 4 entre códigos, el sistema puede detectar y corregir errores de 1 bit que ocurran por ruido en las imágenes.
+
+```{r codebook}
+codebook <- read.csv("codebook.csv", row.names = 1)
+
+slice_sample(codebook, n = 5) %>%
+  knitr::kable(caption = "Muestra aleatoria de 5 genes con sus barcodes. Cada columna es un bit (ronda_canal).")
+```
+
+------------------------------------------------------------------------
+
+## 4. Factores de escala
+
+No todas las rondas y canales tienen la misma intensidad de fluorescencia. Hay variación técnica debida a diferencias en la eficiencia de las sondas, el tiempo de exposición y el fotoblanqueo acumulado. Los factores de escala permiten normalizar estas diferencias para que los bits sean comparables entre sí.
+
+```{r factores-escala, fig.width=8, fig.height=4}
+sf <- read.csv("scale_factors.csv")
+
+ggplot(sf, aes(x = factor(r), y = scale_factor, fill = factor(c))) +
+  geom_col(position = "dodge") +
+  labs(x = "Ronda", y = "Factor de escala", fill = "Canal",
+       title = "Variación de intensidad entre canales y rondas") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+## 5. Normalización por factores de escala
+
+Dividimos cada cuadro del hiperstack por su factor de escala correspondiente. Esto pone todas las rondas y canales en la misma escala de intensidad, que es necesario para que la comparación contra los barcodes del codebook sea justa.
+
+```{r normalizacion}
+img_norm <- img
+for (i in 1:16) {
+  r <- frame_map$r[i]
+  ch <- frame_map$ch[i]
+  scale_val <- sf$scale_factor[sf$r == r & sf$c == ch]
+  img_norm[,,i] <- img[,,i] / scale_val
+  cat(sprintf("Frame %2d (r=%d, c=%d) / %.3f\n", i, r, ch, scale_val))
+}
+```
+
+------------------------------------------------------------------------
+
+## 6. Preparación para decodificación
+
+Cada píxel de la imagen es ahora un vector de 16 valores de intensidad, uno por cada bit. Para decodificar, tratamos ese vector como un punto en un espacio de 16 dimensiones y lo comparamos contra los vectores del codebook. Antes de comparar, normalizamos ambos a longitud unitaria (norma) para usar similitud coseno en lugar de distancia euclidiana absoluta, lo que hace la comparación más robusta a variaciones generales de intensidad.
+
+```{r prep-decodificacion}
+nx <- dim(img_norm)[1]
+ny <- dim(img_norm)[2]
+pixel_matrix <- matrix(img_norm, nrow = nx * ny, ncol = 16)
+
+# Normalizar píxeles a longitud unitaria
+pixel_norms <- sqrt(rowSums(pixel_matrix^2))
+pixel_normed <- pixel_matrix / pixel_norms
+pixel_normed[is.nan(pixel_normed)] <- 0
+
+# Normalizar codebook
+col_order <- paste0("r", frame_map$r, "_c", frame_map$ch)
+codebook_ordered <- codebook[, col_order]
+cb_matrix <- as.matrix(codebook_ordered)
+cb_norms <- sqrt(rowSums(cb_matrix^2))
+cb_normed <- cb_matrix / cb_norms
+```
+
+------------------------------------------------------------------------
+
+## 7. Decodificación
+
+El paso central del pipeline. Para cada píxel, calculamos su producto punto con todos los barcodes del codebook esto es equivalente a la similitud coseno cuando ambos vectores están normalizados. El gen asignado es el que tiene el barcode más parecido al vector del píxel. Si la distancia al barcode más cercano supera un umbral (0.572), el píxel se deja sin asignar, lo que ayuda a descartar ruido o señal ambigua.
+
+```{r decodificacion}
+cat("Calculando productos punto...\n")
+dots <- pixel_normed %*% t(cb_normed)
+
+best_gene_idx <- max.col(dots, ties.method = "first")
+best_dot <- dots[cbind(1:nrow(dots), best_gene_idx)]
+best_distance <- sqrt(2 - 2 * pmin(best_dot, 1))
+
+threshold <- 0.572
+decoded <- best_gene_idx
+decoded[best_distance > threshold] <- NA
+
+decoded_full <- matrix(decoded, nrow = nx, ncol = ny)
+gene_names <- rownames(codebook)
+
+cat(sprintf("Píxeles decodificados: %d de %d (%.1f%%)\n",
+            sum(!is.na(decoded)), length(decoded),
+            100 * sum(!is.na(decoded)) / length(decoded)))
+```
+
+------------------------------------------------------------------------
+
+## 8. Mapa de genes decodificados
+
+Cada color en esta imagen representa un gen distinto. La distribución espacial de los colores refleja directamente dónde están las moléculas de RNA dentro del campo visual. Con 140 genes codificados es difícil distinguir colores individuales, pero la estructura celular ya es visible.
+
+```{r mapa-genes, fig.width=8, fig.height=8}
+image(decoded_full, col = c("black", rainbow(length(gene_names))),
+      main = "Genes decodificados (140 colores)",
+      useRaster = TRUE, axes = FALSE)
+```
+
+------------------------------------------------------------------------
+
+## 9. Validación contra el benchmark
+
+Para saber si nuestra decodificación es correcta, comparamos los conteos de cada gen que obtuvimos con los resultados publicados por los autores del dataset. Una correlación alta entre ambos indica que nuestro pipeline reproduce bien los resultados del paper original.
+
+```{r benchmark, fig.width=7, fig.height=6}
+bench <- read.csv(
+  "https://d2nhj9g34unfro.cloudfront.net/MERFISH/benchmark_results.csv",
+  colClasses = c("barcode" = "character")
+)
+
+bench_counts <- bench %>%
+  group_by(gene) %>%
+  summarise(benchmark = n())
+
+decoded_vector <- as.vector(decoded_full)
+decoded_genes <- gene_names[decoded_vector[!is.na(decoded_vector)]]
+
+our_counts <- data.frame(gene = decoded_genes) %>%
+  group_by(gene) %>%
+  summarise(ours = n())
+
+comparison <- inner_join(bench_counts, our_counts, by = "gene")
+r_val <- cor(comparison$benchmark, comparison$ours)
+
+ggplot(comparison, aes(x = benchmark, y = ours)) +
+  geom_point(size = 2, alpha = 0.6, color = "#00BFC4") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "white") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Conteo publicado (benchmark)",
+       y = "Conteo de nuestro pipeline",
+       title = paste0("Correlación con el benchmark: r = ", round(r_val, 3))) +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "grey20"),
+        panel.background = element_rect(fill = "grey20"),
+        text = element_text(color = "white"),
+        axis.text = element_text(color = "grey80"))
+```
+
+------------------------------------------------------------------------
+
+## 10. Segmentación celular
+
+Las máscaras de células fueron generadas previamente con Cellpose, un algoritmo de segmentación basado en redes neuronales que identifica los núcleos celulares a partir de la imagen de DAPI. A esas máscaras de núcleos se les aplicó una expansión de Voronoi de hasta 50 píxeles para cubrir el citoplasma y poder asignar transcritos que no están justo en el núcleo.
+
+```{r segmentacion}
+library(Seurat)
+library(tiff)
+library(Matrix)
+
+nuclei <- readTIFF("nuclei_DAPI.tiff")
+nuclei <- t(nuclei)
+
+expanded_masks <- readTIFF("expanded_masks.tif", as.is = TRUE)
+expanded_masks <- t(expanded_masks)
+
+cell_masks <- readTIFF("cell_masks.tif", as.is = TRUE)
+cell_masks <- t(cell_masks)
+
+cat(sprintf("Imagen de núcleos: %s\n", paste(dim(nuclei), collapse = "x")))
+cat(sprintf("Células detectadas: %d\n", length(unique(expanded_masks[expanded_masks > 0]))))
+cat(sprintf("Píxeles con gen asignado: %d\n", sum(!is.na(decoded_full))))
+```
+
+------------------------------------------------------------------------
+
+## 11. Visualización de la segmentación
+
+Las tres imágenes muestran, la señal de DAPI que marca los núcleos, las máscaras originales de Cellpose y las máscaras expandidas con Voronoi. La expansión geométrica es una aproximación al citoplasma, no es perfecta biológicamente pero funciona razonablemente bien para datasets de este tamaño.
+
+```{r viz-segmentacion, fig.width=10, fig.height=4}
+par(mfrow = c(1, 3), mar = c(1, 1, 2, 1))
+
+dapi_disp <- nuclei
+upper <- quantile(dapi_disp, 0.995)
+dapi_disp[dapi_disp > upper] <- upper
+dapi_disp <- (dapi_disp - min(dapi_disp)) / (max(dapi_disp) - min(dapi_disp))
+image(dapi_disp, col = grey.colors(256), main = "DAPI", axes = FALSE)
+
+image(cell_masks, col = c("black", rainbow(max(cell_masks))),
+      main = "Máscaras de núcleos (Cellpose)", axes = FALSE)
+
+image(expanded_masks, col = c("black", rainbow(max(expanded_masks))),
+      main = "Máscaras expandidas (Voronoi, 50px)", axes = FALSE)
+```
+
+------------------------------------------------------------------------
+
+## 12. Asignación de transcritos a células
+
+Un transcrito (píxel decodificado) se asigna a una célula si cae dentro de su máscara expandida. Los transcritos que quedan fuera de cualquier máscara no se pueden asignar y se pierden del análisis posterior.
+
+```{r asignacion}
+has_gene <- !is.na(decoded_full)
+has_cell <- expanded_masks > 0
+valid <- has_gene & has_cell
+
+gene_vec <- gene_names[decoded_full[valid]]
+cell_vec <- expanded_masks[valid]
+
+transcript_table <- data.frame(
+  cell = cell_vec,
+  gene = gene_vec,
+  stringsAsFactors = FALSE
+)
+
+cat(sprintf("Total píxeles decodificados:  %d\n", sum(has_gene)))
+cat(sprintf("Asignados a células:          %d\n", sum(valid)))
+cat(sprintf("Sin asignar:                  %d\n", sum(has_gene & !has_cell)))
+cat(sprintf("Fracción asignada: %.1f%%\n", 100 * sum(valid) / sum(has_gene)))
+```
+
+------------------------------------------------------------------------
+
+## 13. Matriz de conteo
+
+Cruzamos genes y células para construir la matriz de expresión: filas son genes, columnas son células, y cada valor es el número de transcritos de ese gen detectados en esa célula. Usamos una matriz dispersa porque la mayoría de los valores son cero.
+
+```{r matriz-conteo}
+count_table <- table(transcript_table$gene, transcript_table$cell)
+count_matrix <- as(count_table, "sparseMatrix")
+colnames(count_matrix) <- paste0("cell_", colnames(count_matrix))
+
+cat(sprintf("Matriz: %d genes × %d células\n", nrow(count_matrix), ncol(count_matrix)))
+cat(sprintf("Total conteos: %d\n", sum(count_matrix)))
+cat(sprintf("Mediana conteos/célula: %.0f\n", median(colSums(count_matrix))))
+cat(sprintf("Mediana genes/célula: %.0f\n", median(colSums(count_matrix > 0))))
+```
+
+------------------------------------------------------------------------
+
+## 14. Distribución de conteos
+
+Estos histogramas muestran cuántos transcritos y cuántos genes distintos se detectaron por célula. Una distribución muy sesgada hacia la izquierda indicaría muchas células con poca señal, lo que puede sugerir problemas de segmentación o células muertas.
+
+```{r distribucion, fig.width=8, fig.height=4}
+counts_per_cell <- colSums(count_matrix)
+genes_per_cell <- colSums(count_matrix > 0)
+
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+hist(counts_per_cell, breaks = 50, col = "steelblue",
+     main = "Transcritos por célula", xlab = "Conteo")
+hist(genes_per_cell, breaks = 50, col = "coral",
+     main = "Genes detectados por célula", xlab = "Conteo")
+```
+
+------------------------------------------------------------------------
+
+## 15. Metadatos celulares
+
+Calculamos el centroide y el área de cada célula a partir de las máscaras. Esta información espacial es lo que después permite proyectar los clusters de expresión génica de vuelta al tejido.
+
+```{r metadatos}
+cell_ids <- sort(unique(as.vector(expanded_masks)))
+cell_ids <- cell_ids[cell_ids > 0]
+
+props_moment <- computeFeatures.moment(expanded_masks)
+props_shape <- computeFeatures.shape(expanded_masks)
+
+cell_meta <- data.frame(
+  cell = paste0("cell_", cell_ids),
+  center_x = props_moment[, "m.cx"],
+  center_y = props_moment[, "m.cy"],
+  area = props_shape[, "s.area"],
+  fov = fov_num,
+  stringsAsFactors = FALSE
+)
+rownames(cell_meta) <- cell_meta$cell
+cell_meta <- cell_meta[colnames(count_matrix), ]
+
+cat(sprintf("Metadatos para %d células\n", nrow(cell_meta)))
+head(cell_meta)
+```
+
+------------------------------------------------------------------------
+
+## 16. Objeto Seurat
+
+Empaquetamos la matriz de conteo y los metadatos en un objeto Seurat con el assay MERFISH. Este objeto es el formato estándar para análisis de transcriptómica de célula única en R y permite hacer todo el pipeline downstream de normalización, reducción de dimensionalidad y clustering.
+
+```{r seurat}
+seurat_voronoi <- CreateSeuratObject(
+  counts = count_matrix,
+  meta.data = cell_meta,
+  assay = "MERFISH"
+)
+
+coords <- data.frame(
+  x = cell_meta$center_x,
+  y = cell_meta$center_y,
+  cell = cell_meta$cell
+)
+
+cents <- CreateCentroids(coords)
+fov_label <- sprintf("fov_%03d", fov_num)
+fov_obj <- CreateFOV(
+  coords = list("centroids" = cents),
+  type = c("centroids"),
+  molecules = NULL,
+  assay = "MERFISH"
+)
+
+seurat_voronoi[[fov_label]] <- fov_obj
+print(seurat_voronoi)
+```
+
+------------------------------------------------------------------------
+
+## 17. Mapa de asignación de transcritos
+
+Los puntos en cyan son transcritos asignados a alguna célula; en rojo los que quedaron fuera de cualquier máscara. La proporción de transcritos asignados depende de qué tan bien la expansión Voronoi cubre el citoplasma real de las células.
+
+```{r mapa-asignacion, fig.width=8, fig.height=8}
+par(mar = c(1, 1, 2, 1))
+image(cell_masks > 0, col = c("white", "grey80"),
+      main = "Asignación de transcritos", axes = FALSE)
+
+assigned_coords <- which(valid, arr.ind = TRUE)
+if (nrow(assigned_coords) > 50000) {
+  assigned_coords <- assigned_coords[sample(nrow(assigned_coords), 50000), ]
+}
+points(assigned_coords[,1] / nrow(decoded_full),
+       assigned_coords[,2] / ncol(decoded_full),
+       pch = 16, cex = 0.4, col = adjustcolor("cyan", 0.7))
+
+unassigned_mask <- has_gene & !has_cell
+unassigned_coords <- which(unassigned_mask, arr.ind = TRUE)
+if (nrow(unassigned_coords) > 50000) {
+  unassigned_coords <- unassigned_coords[sample(nrow(unassigned_coords), 50000), ]
+}
+points(unassigned_coords[,1] / nrow(decoded_full),
+       unassigned_coords[,2] / ncol(decoded_full),
+       pch = 16, cex = 0.4, col = adjustcolor("red", 0.7))
+
+legend("bottomright", pch = 16, col = c("grey80", "cyan", "red"),
+       legend = c("Núcleos",
+                  sprintf("Asignados (%d)", sum(valid)),
+                  sprintf("Sin asignar (%d)", sum(has_gene & !has_cell))),
+       bg = "white", cex = 0.9)
+```
+
+------------------------------------------------------------------------
+
+## 18. Análisis downstream con Seurat
+
+Con el objeto construido corremos el pipeline estándar: normalización, selección de genes variables, escalado, PCA, UMAP y clustering. Con solo 140 genes el PCA tiene menos dimensiones que en scRNA-seq típico, pero la estructura celular sigue siendo recuperable.
+
+```{r pipeline-seurat}
+seurat_obj <- seurat_voronoi
+
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, npcs = 15)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)
+seurat_obj <- FindClusters(seurat_obj, resolution = 1)
+```
+
+------------------------------------------------------------------------
+
+## 19. UMAP y mapa espacial de clusters
+
+El UMAP muestra los grupos de células según su perfil de expresión génica. El mapa espacial proyecta esos mismos clusters de vuelta a sus posiciones reales en el tejido, lo que permite ver si los grupos transcriptómicos tienen también una organización espacial.
+
+```{r umap-espacial, fig.width=12, fig.height=5}
+library(patchwork)
+
+p1 <- DimPlot(seurat_obj, reduction = "umap", label = TRUE, pt.size = 5) +
+  ggtitle("UMAP — clusters") +
+  theme_minimal()
+
+p2 <- ggplot(data.frame(x = cell_meta$center_x,
+                        y = cell_meta$center_y,
+                        cluster = seurat_obj$seurat_clusters),
+             aes(x = x, y = y, color = cluster)) +
+  geom_point(size = 5) +
+  coord_equal() +
+  labs(title = "Clusters en el tejido") +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "black"))
+
+p1 + p2
+```
+
+------------------------------------------------------------------------
+
+## 20. Genes marcadores por cluster
+
+Identificamos los genes diferencialmente expresados en cada cluster. Estos marcadores son los genes que mejor distinguen a cada grupo celular del resto y sirven para interpretar biológicamente a qué tipo celular podría corresponder cada cluster.
+
+```{r marcadores}
+markers <- FindAllMarkers(seurat_obj,
+                          only.pos = TRUE,
+                          min.pct = 0.1,
+                          logfc.threshold = 0.25)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 5)
+
+print(top_markers[, c("cluster", "gene", "avg_log2FC", "p_val_adj")])
+```
+
+------------------------------------------------------------------------
+
+## 21. Heatmap de marcadores
+
+El heatmap muestra los top genes marcadores de cada cluster con su nivel de expresión por célula. Permite ver de un vistazo qué tan específico es cada marcador y si los clusters tienen perfiles de expresión claramente distintos.
+
+```{r heatmap, fig.width=10, fig.height=6}
+top5 <- top_markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 5) %>%
+  pull(gene) %>%
+  unique()
+
+DoHeatmap(seurat_obj, features = top5) +
+  scale_fill_viridis_c()
+```
+
+------------------------------------------------------------------------
+
+## 22. Guardar el objeto Seurat
+
+```{r guardar}
+saveRDS(seurat_voronoi, file = "seurat_voronoi_fov_125.rds")
+cat("Objeto guardado como seurat_voronoi_fov_125.rds\n")
+print(seurat_voronoi)
+```
+
+------------------------------------------------------------------------
+
+## Resumen del pipeline
+
+| Paso | Herramienta | Resultado |
+|------------------|-----------------------------|-------------------------|
+| Preprocesamiento de imágenes | FIJI | `merfish_processed_fov_125.tif` |
+| Decodificación pixel-based | R / EBImage | Mapa de genes 2048×2048 |
+| Segmentación celular | Cellpose + Voronoi | `cell_masks.tif`, `expanded_masks.tif` |
+| Asignación de transcritos | R | Matriz genes × células |
+| Análisis downstream | Seurat | `seurat_voronoi_fov_125.rds` |
